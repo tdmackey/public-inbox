@@ -3,6 +3,8 @@ name: IPC portability
 on:
   pull_request:
   push:
+    branches:
+      - topic/ipc-stream-fallback
   workflow_dispatch:
 
 permissions:
