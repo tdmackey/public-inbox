@@ -11,8 +11,9 @@ Things got weirder in 2021:
   single-writer during long, parallel imports.  It may eventually become
   a read-write IMAP/JMAP server.
 
-* SOCK_SEQPACKET is used extensively in lei, and will likely make its
-  way into more places, still.
+* SOCK_SEQPACKET is preferred for lei IPC.  Systems without it use
+  one-byte SOCK_STREAM notifications carrying descriptor-backed records,
+  which retain message boundaries and SCM_RIGHTS file descriptor passing.
 
 And even more so in 2022:
 

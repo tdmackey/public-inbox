@@ -76,7 +76,8 @@ L<lei-index(1)>.
 =head1 IPC
 
 L<lei-daemon(8)> communicates with the C<lei/store> process using
-L<unix(7)> C<SOCK_SEQPACKET> sockets.
+L<unix(7)> C<SOCK_SEQPACKET> sockets where available, and
+SCM_RIGHTS-backed C<SOCK_STREAM> records otherwise.
 
 =head1 CAVEATS
 

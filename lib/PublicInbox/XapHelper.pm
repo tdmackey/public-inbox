@@ -11,7 +11,7 @@ use PublicInbox::Search qw(xap_terms);
 use PublicInbox::CodeSearch;
 use PublicInbox::IPC;
 use PublicInbox::IO qw(read_all);
-use Socket qw(SOL_SOCKET SO_TYPE SOCK_SEQPACKET AF_UNIX);
+use Socket qw(SOL_SOCKET SO_TYPE SOCK_SEQPACKET SOCK_STREAM AF_UNIX);
 use PublicInbox::DS qw(awaitpid);
 use autodie qw(open getsockopt);
 use POSIX qw(:signal_h);
@@ -272,7 +272,7 @@ sub recv_loop {
 	while (defined($in)) {
 		PublicInbox::DS::sig_setmask($workerset);
 		# we undef $in in SIG{TERM}
-		my @io = eval { PublicInbox::IPC::recvcmd_eor($in, $rbuf) };
+		my @io = eval { PublicInbox::IPC::recvcmd($in, $rbuf) };
 		if ($@) {
 			exit if !$in; # hit by SIGTERM
 			die;
@@ -354,7 +354,9 @@ sub xh_alive { $in || scalar(keys %WORKERS) }
 sub start (@) {
 	my (@argv) = @_;
 	my $c = getsockopt(local $in = \*STDIN, SOL_SOCKET, SO_TYPE);
-	unpack('i', $c) == SOCK_SEQPACKET or die 'stdin is not SOCK_SEQPACKET';
+	my $sock_type = unpack('i', $c);
+	($sock_type == SOCK_SEQPACKET || $sock_type == SOCK_STREAM) or
+		die 'stdin is not SOCK_SEQPACKET or SOCK_STREAM';
 
 	local (%SRCH, %WORKERS, $SHARD_NFD, $MY_FD_MAX);
 	PublicInbox::Search::load_xapian();

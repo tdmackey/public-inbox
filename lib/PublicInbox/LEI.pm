@@ -9,9 +9,9 @@ package PublicInbox::LEI;
 use v5.12;
 use parent qw(PublicInbox::DS PublicInbox::LeiExternal
 	PublicInbox::LeiQuery);
-use autodie qw(bind chdir listen open pipe socket socketpair syswrite unlink);
+use autodie qw(bind chdir listen open pipe socket syswrite unlink);
 use Getopt::Long ();
-use Socket qw(AF_UNIX SOCK_SEQPACKET pack_sockaddr_un);
+use Socket qw(AF_UNIX pack_sockaddr_un);
 use Errno qw(EPIPE EAGAIN ECONNREFUSED ENOENT ECONNRESET EINTR);
 use Cwd qw(getcwd);
 use POSIX qw(strftime);
@@ -28,7 +28,8 @@ use PublicInbox::Git qw(git_exe);
 use PublicInbox::Import;
 use PublicInbox::ContentHash qw(git_sha);
 use PublicInbox::OnDestroy;
-use PublicInbox::IPC qw(send_eor);
+use PublicInbox::IPC qw(send_pkt);
+use PublicInbox::IPCSocket qw(ipc_pair lei_sock_type);
 use PublicInbox::Search;
 use PublicInbox::IO qw(poll_in read_all);
 use PublicInbox::XapHelperCxx;
@@ -493,7 +494,7 @@ sub _drop_wq {
 	}
 }
 
-sub send_gently ($$) { eval { send_eor $_[0], $_[1] } }
+sub send_gently ($$) { eval { send_pkt $_[0], $_[1] } }
 
 # pronounced "exit": x_it(1 << 8) => exit(1); x_it(13) => SIGPIPE
 sub x_it ($$) {
@@ -1057,7 +1058,7 @@ sub start_mua {
 
 sub send_exec_cmd { # tell script/lei to execute a command
 	my ($self, $io, $cmd, $env) = @_;
-	PublicInbox::IPC::sendcmd_eor(
+	PublicInbox::IPC::sendcmd(
 			$self->{sock} // die('lei client gone'),
 			$io, exec_buf($cmd, $env)) //
 		Carp::croak("sendmsg: $!");
@@ -1153,7 +1154,7 @@ sub accept_dispatch { # Listener {post_accept} callback
 	do {
 		poll_in $sock, 60_000 or return send_gently $sock,
 						'timed out waiting to recv FDs';
-		@io = PublicInbox::IPC::recvcmd_eor($sock, $buf) or return;
+		@io = PublicInbox::IPC::recvcmd($sock, $buf) or return;
 	} while (!defined($io[0]) && $! == EAGAIN);
 	if (!defined($io[0])) {
 		warn(my $msg = "recvcmd failed: $!");
@@ -1204,7 +1205,7 @@ sub event_step {
 	local %ENV = %{$self->{env}};
 	local $current_lei = $self;
 	eval {
-		my @io = PublicInbox::IPC::recvcmd_eor($self->{sock} // return,
+		my @io = PublicInbox::IPC::recvcmd($self->{sock} // return,
 							my $buf, 4096);
 		if (scalar(@io) == 1 && !defined($io[0])) {
 			return if $! == EAGAIN;
@@ -1264,7 +1265,7 @@ sub cfg2lei ($) {
 	open($lei->{1}, '>>&', \*STDOUT);
 	open($lei->{2}, '>>&', \*STDERR);
 	open($lei->{3}, '<', '/');
-	socketpair(my $x, my $y, AF_UNIX, SOCK_SEQPACKET, 0);
+	my ($x, $y) = ipc_pair();
 	$lei->{sock} = $x;
 	require PublicInbox::LeiSelfSocket;
 	PublicInbox::LeiSelfSocket->new($y); # adds to event loop
@@ -1364,11 +1365,14 @@ sub spawn_tmp_xh { # called in top-level lei-daemon
 
 # lei(1) calls this when it can't connect
 sub lazy_start {
-	my ($sock_path, $errno, $narg) = @_;
+	my ($sock_path, $errno, $narg, $sock_type) = @_;
+	$sock_type //= 'seq'; # compatibility with pre-stream script/lei
+	my $listener_type = lei_sock_type($sock_type);
 	local ($errors_log, $listener, $PublicInbox::Search::XHC);
 
 	# no point in using xap_helper w/o C++ features for local clients
-	my $xh_cmd = eval { PublicInbox::XapHelperCxx::cmd() };
+	my $xh_cmd = $sock_type eq 'seq' ?
+		eval { PublicInbox::XapHelperCxx::cmd() } : undef;
 	$PublicInbox::Search::XHC = $xh_cmd ? undef : 0;
 	if ($xh_cmd) {
 		require PublicInbox::XapClient;
@@ -1380,7 +1384,7 @@ sub lazy_start {
 	my $lk = PublicInbox::Lock->new($errors_log);
 	umask(077) // die("umask(077): $!");
 	$lk->lock_acquire;
-	socket($listener, AF_UNIX, SOCK_SEQPACKET, 0);
+	socket($listener, AF_UNIX, $listener_type, 0);
 	if ($errno == ECONNREFUSED || $errno == ENOENT) {
 		return if connect($listener, $addr); # another process won
 		unlink($sock_path) if $errno == ECONNREFUSED && -S $sock_path;
@@ -1622,16 +1626,15 @@ sub cfg_dump ($$) {
 sub request_umask { # assumes client is trusted and fast
 	my ($lei) = @_;
 	my $s = $lei->{sock} // return;
-	send_eor($s, 'umask') // die "send: $!"; # never EAGAIN
-	my ($v, $r, $u);
-	do { # n.b. poll_in returns -1 on EINTR
-		vec($v = '', fileno($s), 1) = 1;
-		$r = poll_in $s, 60_000 or die 'timeout waiting for umask';
-	} while ($r < 0 && $! == EINTR);
+	send_pkt($s, 'umask') // die "send: $!"; # never EAGAIN
+	my ($v, $r, $u, @io);
 	do {
-		$r = recv $s, $v, 5, 0;
-		die "recv: $!" if !defined($r) && $! != EINTR;
-	} while (!defined $r);
+		do { # n.b. poll_in returns -1 on EINTR
+			$r = poll_in $s, 60_000 or die 'timeout waiting for umask';
+		} while ($r < 0 && $! == EINTR);
+		@io = PublicInbox::IPC::recvcmd($s, $v, 5);
+	} while (@io == 1 && !defined($io[0]) && $! == EAGAIN);
+	defined($io[0]) or die "recv: $!" if @io;
 	($u, $lei->{client_umask}) = unpack('AV', $v);
 	$u eq 'u' or warn "E: recv $v has no umask";
 }

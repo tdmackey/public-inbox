@@ -27,21 +27,26 @@ FD passing is used to reduce IPC costs for bulk I/O when
 importing large mboxes from stdin and dumping large mboxes
 to stdout.
 
-=head2 SOCK_SEQPACKET
+=head2 local sockets
 
-SOCK_SEQPACKET sockets are used for both communicating with
-L<lei(1)> and to internal workers.  SOCK_SEQPACKET guarantees
-reliability (unlike SOCK_DGRAM), allows easy load distribution,
-and saves developers the trouble of maintaining stream parsers.
+SOCK_SEQPACKET sockets are preferred for both communicating with
+L<lei(1)> and internal workers.  SOCK_SEQPACKET guarantees reliability
+(unlike SOCK_DGRAM) and allows easy load distribution.
+
+On systems without AF_UNIX SOCK_SEQPACKET support, lei uses SOCK_STREAM.
+Each logical record is stored in an anonymous file and transferred with
+its file descriptors by SCM_RIGHTS alongside a one-byte notification.
+This preserves record boundaries for concurrent readers and writers and
+keeps partial writes or writer termination from corrupting later records.
 
 =head2 file monitoring
 
 Inotify or EVFILT_VNODE is used depending on the platform
 to monitor Maildirs for changes and track keyword changes.
 
-The listen socket (default: C<$XDG_RUNTIME_DIR/lei/5.seq.sock>)
-is also monitored, and the daemon will automatically shutdown
-if it is unlinked.
+The listen socket (normally C<$XDG_RUNTIME_DIR/lei/5.seq.sock>, or
+C<5.stream.sock> when using SOCK_STREAM) is also monitored, and the
+daemon will automatically shutdown if it is unlinked.
 
 =head1 CONTACT
 

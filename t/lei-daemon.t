@@ -2,11 +2,16 @@
 # Copyright (C) all contributors <meta@public-inbox.org>
 # License: AGPL-3.0+ <https://www.gnu.org/licenses/agpl-3.0.txt>
 use strict; use v5.10.1; use PublicInbox::TestCommon;
-use Socket qw(AF_UNIX SOCK_SEQPACKET pack_sockaddr_un);
+use Socket qw(AF_UNIX pack_sockaddr_un);
+use PublicInbox::IPCSocket qw(lei_client_socket lei_sock_path lei_sock_type);
 require PublicInbox::IPC;
 
+my $native_type;
 test_lei({ daemon_only => 1 }, sub {
-	my $sock = "$ENV{XDG_RUNTIME_DIR}/lei/5.seq.sock";
+	my $probe;
+	($probe, $native_type) = lei_client_socket();
+	undef $probe;
+	my $sock = lei_sock_path("$ENV{XDG_RUNTIME_DIR}/lei", 5, $native_type);
 	my $err_log = "$ENV{XDG_RUNTIME_DIR}/lei/errors.log";
 	lei_ok('daemon-pid');
 	ignore_inline_c_missing($lei_err);
@@ -28,10 +33,10 @@ test_lei({ daemon_only => 1 }, sub {
 		my $addr = pack_sockaddr_un($sock);
 		open my $null, '<', '/dev/null' or BAIL_OUT "/dev/null: $!";
 		for (0..10) {
-			socket(my $c, AF_UNIX, SOCK_SEQPACKET, 0) or
+			socket(my $c, AF_UNIX, lei_sock_type($native_type), 0) or
 							BAIL_OUT "socket: $!";
 			connect($c, $addr) or BAIL_OUT "connect: $!";
-			PublicInbox::IPC::sendcmd_eor($c,
+			PublicInbox::IPC::sendcmd($c,
 						[ $null, $null, $null ], 'hi');
 		}
 		lei_ok('daemon-pid');
@@ -70,5 +75,16 @@ test_lei({ daemon_only => 1 }, sub {
 	}
 	ok(!kill(0, $new_pid), 'daemon exits after unlink');
 });
+
+if (($native_type // '') ne 'stream') {
+	local $ENV{PI_TEST_LEI_STREAM} = 1;
+	test_lei({ daemon_only => 1 }, sub {
+		my $sock = "$ENV{XDG_RUNTIME_DIR}/lei/5.stream.sock";
+		lei_ok('daemon-pid');
+		is($lei_err, '', 'no error from stream daemon-pid');
+		like($lei_out, qr/\A[0-9]+\n\z/s, 'stream daemon PID returned');
+		ok(-S $sock, 'stream socket created');
+	});
+}
 
 done_testing;
