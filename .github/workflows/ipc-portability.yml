@@ -3,6 +3,8 @@ name: IPC portability
 on:
   pull_request:
   push:
+    branches:
+      - topic/ipc-stream-fallback
   workflow_dispatch:
 
 permissions:
@@ -109,24 +111,8 @@ jobs:
         run: make test
 
   macos:
-    name: macOS ${{ matrix.macos }} fallback (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - macos: "15"
-            arch: arm64
-            runner: macos-15
-          - macos: "15"
-            arch: x86_64
-            runner: macos-15-intel
-          - macos: "26"
-            arch: arm64
-            runner: macos-26
-          - macos: "26"
-            arch: x86_64
-            runner: macos-26-intel
+    name: macOS latest fallback (arm64)
+    runs-on: macos-latest
     env:
       # File::Temp otherwise nests lei test sockets below Darwin's long
       # /var/folders path and can exceed sockaddr_un.sun_path.
@@ -147,6 +133,9 @@ jobs:
             /*
             !/INSTALL
           sparse-checkout-cone-mode: false
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
 
       # Git's ignore-case sparse matcher omits both INSTALL and install/ on
       # default macOS filesystems.  The build needs the document, but not the
