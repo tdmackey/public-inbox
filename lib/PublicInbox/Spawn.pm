@@ -204,7 +204,7 @@ static int sendmsg_retry(long *tries)
 }
 
 #if defined(CMSG_SPACE) && defined(CMSG_LEN)
-#define SEND_FD_CAPA 10
+#define SEND_FD_CAPA 11
 #define SEND_FD_SPACE (SEND_FD_CAPA * sizeof(int))
 union my_cmsg {
 	struct cmsghdr hdr;

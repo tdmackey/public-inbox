@@ -4,13 +4,13 @@
 # base class for remote IPC calls and workqueues, requires Storable or Sereal
 # - ipc_do and ipc_worker_* is for a single worker/producer and uses pipes
 # - wq_io_do and wq_worker* is for a single producer and multiple workers,
-#   using SOCK_SEQPACKET for work distribution
+#   using record-preserving AF_UNIX sockets for work distribution
 # use ipc_do when you need work done on a certain process
 # use wq_io_do when your work can be done on any idle worker
 package PublicInbox::IPC;
 use v5.12;
 use parent qw(Exporter);
-use autodie qw(close open pipe read send socketpair sysseek);
+use autodie qw(close open pipe read send sysseek);
 use Errno qw(EAGAIN EINTR);
 use Carp qw(croak carp);
 use Fcntl qw(SEEK_SET);
@@ -18,11 +18,15 @@ use PublicInbox::Syscall qw(MY_SEQPACKET_MAX);
 use PublicInbox::DS qw(awaitpid);
 use PublicInbox::IO qw(my_bufread my_gets read_all);
 use PublicInbox::OnDestroy;
+use PublicInbox::IPCSocket qw(ipc_pair);
 use PublicInbox::WQWorker;
-use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET MSG_EOR);
+use Socket qw(SOCK_STREAM MSG_EOR SOL_SOCKET SO_TYPE);
 use Scalar::Util qw(blessed reftype);
 
-our @EXPORT_OK = qw(ipc_freeze ipc_thaw nproc_shards send_eor);
+our @EXPORT_OK = qw(ipc_freeze ipc_thaw nproc_shards send_eor send_pkt);
+use constant STREAM_HDR_LEN => 8;
+use constant STREAM_MAGIC => "PI\0\1";
+use constant STREAM_MAX_FDS => 10;
 my ($enc, $dec);
 # ->imports at BEGIN turns sereal_*_with_object into custom ops on 5.14+
 # and eliminate method call overhead
@@ -329,7 +333,7 @@ sub recvcmd_eor ($$;$$) {
 
 sub recv_and_run {
 	my ($self, $s2, $len) = @_;
-	my @io = recvcmd_eor($s2, my $buf);
+	my @io = recvcmd($s2, my $buf);
 	return if scalar(@io) && !defined($io[0]);
 	my $n = length($buf) or return 0;
 	local @$self{0..$#io} = @io;
@@ -378,7 +382,7 @@ sub wq_broadcast {
 	# FIXME: support retry on ENOBUFS for tiny systems
 	for my $bcast1 (values %$wkr) {
 		my $sock = $bcast1 // $self->{-wq_s1} // next;
-		eval { send_eor($sock, $buf) } //
+		eval { send_pkt($sock, $buf) } //
 			push(@exc, $@ || "send: unexpected $!");
 	}
 	croak "@exc" if @exc;
@@ -407,9 +411,98 @@ sub sendcmd_eor ($$$;$) {
 	$n == length($buf) ? $n : croak('sendmsg('.length($buf)." > $n)");
 }
 
+sub _sock_stream ($) {
+	my ($s) = @_;
+	my $stream = ${*$s}{pi_ipc_stream};
+	return $stream if defined $stream;
+	my $type = getsockopt($s, SOL_SOCKET, SO_TYPE) //
+		croak "getsockopt(SO_TYPE): $!";
+	${*$s}{pi_ipc_stream} = unpack('i', $type) == SOCK_STREAM ? 1 : 0;
+}
+
+sub sendcmd_stream ($$$;$) {
+	my ($s, $io, $buf, $tries) = @_;
+	$io //= [];
+	@$io <= STREAM_MAX_FDS or croak 'stream IPC has too many FDs: '.@$io;
+	length($buf) or croak 'stream IPC payload must not be empty';
+	open my $frame, '+>', undef;
+	print $frame pack('a4N', STREAM_MAGIC, scalar(@$io)),
+		$buf or croak "write stream IPC record: $!";
+	$frame->flush or croak "flush stream IPC record: $!";
+	sysseek $frame, SEEK_SET, 0;
+	my @send_io = ($frame, @$io);
+	my $n;
+	while (1) {
+		$n = $send_cmd->($s, \@send_io, "\0", 0, $tries // 50);
+		last if defined $n;
+		return if $! == EAGAIN;
+		return if defined($tries) && !$tries &&
+			($!{ENOBUFS} || $!{ENOMEM} || $!{ETOOMANYREFS});
+		croak "stream IPC sendmsg: $!";
+	}
+	$n == 1 or croak "stream IPC sendmsg returned $n";
+	length($buf);
+}
+
+sub recvcmd_stream ($$;$) {
+	my ($s, undef, $max) = @_;
+	my @io = $recv_cmd->($s, my $token, 1);
+	if (@io == 1 && !defined($io[0])) {
+		$_[1] = '';
+		return @io;
+	}
+	if ($token eq '') {
+		$_[1] = '';
+		return;
+	}
+	$token eq "\0" or croak 'stream IPC notification mismatch';
+	@io or croak 'stream IPC record FD missing';
+	my $frame = shift @io;
+	-f $frame && -r _ && -w _ or croak 'stream IPC record FD is invalid';
+	my $size = -s _;
+	$size >= STREAM_HDR_LEN or croak 'stream IPC record header truncated';
+	(!defined($max) || $size <= $max + STREAM_HDR_LEN) or
+		croak "stream IPC record too large: $size";
+	sysseek $frame, SEEK_SET, 0;
+	my $record = read_all($frame, $size);
+	my ($magic, $nfd) = unpack('a4N', $record);
+	$magic eq STREAM_MAGIC or croak 'stream IPC record magic mismatch';
+	my $len = $size - STREAM_HDR_LEN;
+	$len or croak 'stream IPC payload must not be empty';
+	(!defined($max) || $len <= $max) or
+		croak "stream IPC payload too large: $len > $max";
+	$nfd == @io or croak 'stream IPC FD count mismatch: '.
+		scalar(@io)." != $nfd";
+	$_[1] = substr($record, STREAM_HDR_LEN);
+	@io;
+}
+
+# These wrappers preserve the existing SOCK_SEQPACKET wire format and use
+# descriptor-backed records only when the socket itself is SOCK_STREAM.
+sub send_pkt ($$) {
+	_sock_stream($_[0]) ? sendcmd_stream($_[0], [], $_[1]) :
+		send_eor($_[0], $_[1]);
+}
+
+sub sendcmd ($$$;$) {
+	_sock_stream($_[0]) ?
+		sendcmd_stream($_[0], $_[1], $_[2], $_[3]) :
+		sendcmd_eor($_[0], $_[1], $_[2], $_[3]);
+}
+
+sub sendcmd_nonblock ($$$) {
+	_sock_stream($_[0]) ? sendcmd_stream($_[0], $_[1], $_[2], 0) :
+		sendcmd_eor($_[0], $_[1], $_[2]);
+}
+
+sub recvcmd ($$;$$) {
+	_sock_stream($_[0]) ? recvcmd_stream($_[0], $_[1], $_[2]) :
+		recvcmd_eor($_[0], $_[1], $_[2], $_[3]);
+}
+
 sub wq_io_do { # always async
 	my ($self, $sub, $io, @args) = @_;
-	sendcmd_eor($self->{-wq_s1} // Carp::confess('no -wq_s1'), $io,
+	sendcmd($self->{-wq_s1} // Carp::confess('no -wq_s1'), $io,
 			ipc_freeze([$sub, @args])) // croak "sendmsg: $!".
 			($!{ETOOMANYREFS} ? ' (check RLIMIT_NOFILE)' : '')
 }
@@ -447,9 +540,10 @@ sub wq_nonblock_do { # always async
 	my $buf = ipc_freeze([$sub, @args]);
 	if ($self->{wqb}) { # saturated once, assume saturated forever
 		$self->{wqb}->flush_send($buf);
-	} elsif (defined sendcmd_eor($self->{-wq_s1}, [], $buf)) {
+	} elsif (defined sendcmd_nonblock($self->{-wq_s1}, [], $buf)) {
 		# success!
-	} elsif ($!{EAGAIN} || $!{ENOBUFS} || $!{ENOMEM}) {
+	} elsif ($!{EAGAIN} || $!{ENOBUFS} || $!{ENOMEM} ||
+			$!{ETOOMANYREFS}) {
 		PublicInbox::WQBlocked->new($self, $buf);
 	} else {
 		croak "sendmsg: $!";
@@ -459,7 +553,7 @@ sub wq_nonblock_do { # always async
 sub _wq_worker_start {
 	my ($self, $oldset, $fields, $one, @cb_args) = @_;
 	my ($bcast1, $bcast2);
-	$one or socketpair($bcast1, $bcast2, AF_UNIX, SOCK_SEQPACKET, 0);
+	($bcast1, $bcast2) = ipc_pair() unless $one;
 	my $pid = PublicInbox::DS::fork_persist;
 	if ($pid == 0) {
 		undef $bcast1;
@@ -495,7 +589,7 @@ sub wq_workers_start {
 	my ($self, $ident, $nr_workers, $oldset, $fields, @cb_args) = @_;
 	($send_cmd && $recv_cmd) or return;
 	return if $self->{-wq_s1}; # idempotent
-	socketpair($self->{-wq_s1}, $self->{-wq_s2},AF_UNIX, SOCK_SEQPACKET, 0);
+	@$self{qw(-wq_s1 -wq_s2)} = ipc_pair();
 	$self->ipc_atfork_prepare;
 	$nr_workers //= $self->{-wq_nr_workers}; # was set earlier
 	my $sigset = $oldset // PublicInbox::DS::block_signals();

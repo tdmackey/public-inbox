@@ -21,14 +21,14 @@ sub flush_send {
 	while (defined(my $buf = shift @{$self->{msgq}})) {
 		if (ref($buf) eq 'CODE') {
 			$buf->($self); # could be \&PublicInbox::DS::close
-		} elsif (defined(PublicInbox::IPC::sendcmd_eor(
+		} elsif (defined(PublicInbox::IPC::sendcmd_nonblock(
 					$self->{sock}, [], $buf))) {
 			# success
 		} else {
 			if ($!{EAGAIN}) {
 				PublicInbox::DS::epwait($self->{sock},
 							EPOLLOUT|EPOLLONESHOT);
-			} elsif ($!{ENOBUFS} || $!{ENOMEM}) {
+			} elsif ($!{ENOBUFS} || $!{ENOMEM} || $!{ETOOMANYREFS}) {
 				PublicInbox::DS::add_uniq_timer($self + 0,
 						0.1, \&flush_send, $self);
 			} else {

@@ -530,7 +530,7 @@ use constant CMSG_ALIGN_SIZEOF_cmsghdr => CMSG_ALIGN(SIZEOF_cmsghdr);
 sub CMSG_SPACE ($) { CMSG_ALIGN($_[0]) + CMSG_ALIGN_SIZEOF_cmsghdr }
 sub CMSG_LEN ($) { CMSG_ALIGN_SIZEOF_cmsghdr + $_[0] }
 use constant msg_controllen_max =>
-	CMSG_SPACE(10 * SIZEOF_int) + SIZEOF_cmsghdr; # space for 10 FDs
+	CMSG_SPACE(11 * SIZEOF_int) + SIZEOF_cmsghdr; # record + 10 FDs
 
 sub sendmsg_retry ($) {
 	return 1 if $!{EINTR};
@@ -578,7 +578,7 @@ if (defined($SYS_sendmsg) && defined($SYS_recvmsg)) {
 *recv_cmd4 = sub ($$$) {
 	my ($sock, undef, $blen) = @_;
 	vec($_[1] //= '', $blen - 1, 8) = 0;
-	my $cmsghdr = "\0" x msg_controllen_max; # 10 * sizeof(int)
+	my $cmsghdr = "\0" x msg_controllen_max; # 11 * sizeof(int)
 	my $iov = pack('P'.TMPL_size_t, $_[1], $blen);
 	my $mh = pack(TMPL_msghdr,
 			undef, 0, # msg_name, msg_namelen (unused)

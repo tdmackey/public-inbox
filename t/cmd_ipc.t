@@ -4,6 +4,7 @@
 use v5.12;
 use PublicInbox::TestCommon;
 use autodie;
+no autodie qw(socketpair);
 use Socket qw(AF_UNIX SOCK_STREAM SOCK_SEQPACKET MSG_EOR);
 use Fcntl qw(F_GETFL);
 pipe(my $r, my $w);
@@ -15,7 +16,8 @@ my $do_test = sub { SKIP: {
 	my ($type, $flag, $desc) = @_;
 	my ($s1, $s2);
 	my $src = 'a payload' x 40;
-	socketpair($s1, $s2, AF_UNIX, $type, 0);
+	socketpair($s1, $s2, AF_UNIX, $type, 0) or
+		skip "socketpair($desc) unsupported: $!", 1;
 	my $io = [ $r, $w, $s1 ];
 	$send->($s1, $io, $src, $flag);
 	my @io = $recv->($s2, my $buf, length($src) * 2);

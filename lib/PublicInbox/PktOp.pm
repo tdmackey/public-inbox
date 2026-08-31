@@ -10,8 +10,8 @@ use v5.12;
 use parent qw(PublicInbox::DS);
 use Errno qw(EAGAIN ECONNRESET EINTR);
 use PublicInbox::Syscall qw(EPOLLIN);
-use Socket qw(AF_UNIX SOCK_SEQPACKET);
-use PublicInbox::IPC qw(ipc_freeze ipc_thaw send_eor);
+use PublicInbox::IPC qw(ipc_freeze ipc_thaw send_pkt);
+use PublicInbox::IPCSocket qw(ipc_pair);
 use Scalar::Util qw(blessed);
 
 sub new {
@@ -24,14 +24,13 @@ sub new {
 # returns a blessed objects as the consumer and producer
 sub pair {
 	my ($cls) = @_;
-	my ($c, $p);
-	socketpair($c, $p, AF_UNIX, SOCK_SEQPACKET, 0) or die "socketpair: $!";
+	my ($c, $p) = ipc_pair();
 	(new($cls, $c), bless { op_p => $p }, $cls);
 }
 
 sub pkt_do { # for the producer to trigger event_step in consumer
 	my ($self, $cmd, @args) = @_;
-	send_eor $self->{op_p}, @args ? "$cmd\0".ipc_freeze(\@args) : $cmd;
+	send_pkt $self->{op_p}, @args ? "$cmd\0".ipc_freeze(\@args) : $cmd;
 }
 
 sub event_step {
@@ -39,7 +38,7 @@ sub event_step {
 	my $c = $self->{sock};
 	my ($msg, $cmd, @pargs);
 	while (1) {
-		my @io = PublicInbox::IPC::recvcmd_eor($c, $msg, undef, 0);
+		my @io = PublicInbox::IPC::recvcmd($c, $msg, undef, 0);
 		if (@io && !defined($io[0])) {
 			next if $! == EINTR;
 			return if $! == EAGAIN;
