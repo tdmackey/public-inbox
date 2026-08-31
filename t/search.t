@@ -448,8 +448,8 @@ my $dir_mask = 02770;
 
 # FreeBSD, OpenBSD and NetBSD do not allow non-root users to set S_ISGID,
 # so git doesn't set it, either (see DIR_HAS_BSD_GROUP_SEMANTICS in git.git)
-# Presumably all *BSDs behave the same way.
-if (require_bsd) {
+# Presumably all *BSDs behave the same way; Darwin does, too.
+if (require_bsd || $^O eq 'darwin') {
 	$all_mask = 0777;
 	$dir_mask = 0770;
 }

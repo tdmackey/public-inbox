@@ -1,0 +1,228 @@
+name: IPC portability
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipc-portability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  PERL5LIB: ${{ github.workspace }}/lib
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.transport }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: native-seqpacket
+            force_stream: ""
+            expected_transport: seq
+          - transport: forced-stream
+            force_stream: "1"
+            expected_transport: stream
+    env:
+      PI_TEST_LEI_STREAM: ${{ matrix.force_stream }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            git \
+            libdbd-sqlite3-perl \
+            libinline-c-perl \
+            libio-compress-perl \
+            libmail-imapclient-perl \
+            libparse-recdescent-perl \
+            libsearch-xapian-perl \
+            libtest-simple-perl \
+            libtimedate-perl \
+            liburi-perl \
+            libxapian-dev \
+            make \
+            perl \
+            pkg-config \
+            sqlite3 \
+            xapian-tools
+
+      - name: Configure and build
+        run: |
+          mkdir -p "$HOME/.cache/public-inbox/inline-c"
+          perl Makefile.PL
+          make -j2
+
+      - name: Check changed-source syntax
+        run: |
+          for file in \
+            lib/PublicInbox/IPC.pm \
+            lib/PublicInbox/IPCSocket.pm \
+            lib/PublicInbox/LEI.pm \
+            lib/PublicInbox/LeiStore.pm \
+            script/lei
+          do
+            perl -Ilib -c "$file"
+          done
+
+      - name: Verify selected transport
+        env:
+          EXPECTED_TRANSPORT: ${{ matrix.expected_transport }}
+        run: |
+          perl -Ilib -MPublicInbox::IPCSocket=lei_client_socket -e '
+            my ($sock, $type) = lei_client_socket();
+            die "expected $ENV{EXPECTED_TRANSPORT}, got $type\n"
+              unless $type eq $ENV{EXPECTED_TRANSPORT};
+          '
+
+      - name: Run focused IPC and lei daemon tests
+        run: >-
+          prove -Ilib -bvw
+          t/cmd_ipc.t
+          t/ipc-socket.t
+          t/ipc-stream.t
+          t/lei-daemon.t
+          t/lei-stream.t
+          t/xap_helper.t
+
+      - name: Run adjacent IPC and lei regression tests
+        run: prove -Ilib -bvw t/ipc.t t/lei.t
+
+      - name: Run full test suite
+        run: make test
+
+  macos:
+    name: macOS ${{ matrix.macos }} fallback (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - macos: "15"
+            arch: arm64
+            runner: macos-15
+          - macos: "15"
+            arch: x86_64
+            runner: macos-15-intel
+          - macos: "26"
+            arch: arm64
+            runner: macos-26
+          - macos: "26"
+            arch: x86_64
+            runner: macos-26-intel
+    env:
+      # File::Temp otherwise nests lei test sockets below Darwin's long
+      # /var/folders path and can exceed sockaddr_un.sun_path.
+      TMPDIR: /private/tmp
+      # macOS uses the Perl stream helper; do not probe the seqpacket-only C++
+      # helper during generic lei setup.
+      PI_NO_CXX: "1"
+      XAPIAN_BINDINGS_VERSION: "2.1.0"
+      XAPIAN_BINDINGS_SHA256: f52ec189f13b4fa66ea625a6eb94bb32dd651b9ec806be6a911dda54cbe3875c
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/INSTALL
+          sparse-checkout-cone-mode: false
+
+      # Git's ignore-case sparse matcher omits both INSTALL and install/ on
+      # default macOS filesystems.  The build needs the document, but not the
+      # Linux package-manager helpers under install/.
+      - name: Restore case-colliding build document
+        run: git show HEAD:INSTALL >INSTALL
+
+      # Sparse checkout makes actions/checkout use a blobless partial clone.
+      # solver_git.t deliberately reads historical base blobs from the source
+      # repository rather than from the working tree, so hydrate its fixtures.
+      - name: Hydrate historical solver fixtures
+        run: |
+          for oid in \
+            605013e4904baabecd4a0a55997aebd8e8477a8f \
+            15ac20eb871bf47697377e58a27db23102a38fca \
+            3435775c632b5159617452816bc0ccd757465907
+          do
+            git cat-file blob "$oid" >/dev/null
+          done
+
+      - name: Install Perl and Xapian dependencies
+        run: bash .github/scripts/install-macos-test-deps.sh
+
+      - name: Configure and build
+        run: |
+          mkdir -p "$HOME/.cache/public-inbox/inline-c"
+          perl Makefile.PL
+          make -j2
+
+      - name: Check changed-source syntax
+        run: |
+          for file in \
+            lib/PublicInbox/IPC.pm \
+            lib/PublicInbox/IPCSocket.pm \
+            lib/PublicInbox/LEI.pm \
+            lib/PublicInbox/LeiStore.pm \
+            script/lei
+          do
+            perl -Ilib -c "$file"
+          done
+
+      - name: Verify automatic and forced stream selection
+        run: |
+          perl -Ilib -MPublicInbox::IPCSocket=lei_client_socket -e '
+            my ($sock, $type) = lei_client_socket();
+            die "expected stream fallback, got $type\n" unless $type eq "stream";
+          '
+          PI_TEST_LEI_STREAM=1 \
+            perl -Ilib -MPublicInbox::IPCSocket=lei_client_socket -e '
+              my ($sock, $type) = lei_client_socket();
+              die "expected forced stream, got $type\n" unless $type eq "stream";
+            '
+
+      - name: Run focused IPC and lei daemon tests
+        run: >-
+          prove -Ilib -bvw
+          t/cmd_ipc.t
+          t/ipc-socket.t
+          t/ipc-stream.t
+          t/lei-daemon.t
+          t/lei-stream.t
+          t/xap_helper.t
+
+      - name: Run adjacent IPC and lei regression tests
+        run: prove -Ilib -bvw t/ipc.t t/lei.t
+
+      # These fail on unmodified upstream master on Darwin and do not cover
+      # the IPC transport: t/daemon.t (kqueue HUP timing) and t/extsearch.t
+      # (NNTP Xref fixture ordering). Keep every other upstream test gated.
+      - name: Run broad suite with upstream macOS exclusions
+        run: |
+          tests=()
+          for test in t/*.t; do
+            case "$test" in
+              t/daemon.t | t/extsearch.t) ;;
+              *) tests+=("$test") ;;
+            esac
+          done
+          make test TEST_FILES="${tests[*]}"
