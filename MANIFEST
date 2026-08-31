@@ -226,6 +226,7 @@ lib/PublicInbox/IMAPTracker.pm
 lib/PublicInbox/IMAPsearchqp.pm
 lib/PublicInbox/IO.pm
 lib/PublicInbox/IPC.pm
+lib/PublicInbox/IPCSocket.pm
 lib/PublicInbox/IdxStack.pm
 lib/PublicInbox/Import.pm
 lib/PublicInbox/In2Tie.pm
@@ -523,6 +524,8 @@ t/indexlevels-mirror.t
 t/init.t
 t/inotify3.t
 t/io.t
+t/ipc-socket.t
+t/ipc-stream.t
 t/ipc.t
 t/iso-2202-jp.eml
 t/kqnotify.t
@@ -530,6 +533,7 @@ t/learn.t
 t/lei-auto-watch.t
 t/lei-convert.t
 t/lei-daemon.t
+t/lei-stream.t
 t/lei-export-kw.t
 t/lei-externals.t
 t/lei-import-http.t

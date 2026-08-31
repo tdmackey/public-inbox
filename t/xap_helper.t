@@ -5,7 +5,7 @@ use v5.12;
 use PublicInbox::TestCommon;
 require_mods(qw(DBD::SQLite Xapian +SCM_RIGHTS)); # TODO: FIFO support?
 use PublicInbox::Spawn qw(spawn);
-use Socket qw(AF_UNIX SOCK_SEQPACKET SOCK_STREAM);
+use PublicInbox::IPCSocket qw(ipc_pair);
 require PublicInbox::AutoReap;
 use PublicInbox::IPC;
 require PublicInbox::XapClient;
@@ -91,7 +91,7 @@ my $doreq = sub {
 	pipe(my $x, my $y);
 	my $buf = join("\0", @arg, '');
 	my @io = ($y, $err);
-	PublicInbox::IPC::sendcmd_eor($s, \@io, $buf) //
+	PublicInbox::IPC::sendcmd($s, \@io, $buf) //
 		xbail "sendmsg: $!";
 	$x;
 };
@@ -100,7 +100,7 @@ local $SIG{PIPE} = 'IGNORE';
 my $env = { PERL5LIB => join(':', @INC) };
 my $test = sub {
 	my (@cmd) = @_;
-	socketpair(my $s, my $y, AF_UNIX, SOCK_SEQPACKET, 0);
+	my ($s, $y) = ipc_pair();
 	my $pid = spawn(\@cmd, $env, { 0 => $y });
 	my $ar = PublicInbox::AutoReap->new($pid);
 	diag "$cmd[-1] running pid=$pid";
@@ -191,6 +191,9 @@ unless ($ENV{TEST_XH_CXX_ONLY}) {
 			PublicInbox::XapHelper::start('-j1')]);
 }
 SKIP: {
+	my (undef, undef, $sock_type) = ipc_pair();
+	skip 'XapHelperCxx requires SOCK_SEQPACKET', 1
+		if $sock_type eq 'stream';
 	my $cmd = eval {
 		require PublicInbox::XapHelperCxx;
 		PublicInbox::XapHelperCxx::cmd();

@@ -10,27 +10,27 @@ package PublicInbox::XapClient;
 use v5.12;
 use PublicInbox::Spawn qw(spawn);
 use Carp qw(croak);
-use Socket qw(AF_UNIX SOCK_SEQPACKET);
 use PublicInbox::IPC;
-use autodie qw(pipe socketpair);
+use PublicInbox::IPCSocket qw(ipc_pair);
 our $tries = -1; # set to zero by read-only daemon
 
 sub mkreq {
 	my ($self, $io, @arg) = @_;
 	my $buf = join("\0", @arg, '');
-	PublicInbox::IPC::sendcmd_eor($self->{io}, $io, $buf, $tries) //
-		croak "sendcmd_eor: $!";
+	PublicInbox::IPC::sendcmd($self->{io}, $io, $buf, $tries) //
+		croak "sendcmd: $!";
 }
 
 sub start_helper (@) {
 	$PublicInbox::IPC::send_cmd or return; # can't work w/o SCM_RIGHTS
 	my @argv = @_;
-	socketpair(my $sock, my $in, AF_UNIX, SOCK_SEQPACKET, 0);
+	my ($sock, $in, $sock_type) = ipc_pair();
 	my $cls = 'PublicInbox::XapHelperCxx';
 	my $env;
-	my $cmd = eval "require $cls; ${cls}::cmd()";
-	if ($@) { # fall back to Perl + XS|SWIG
-		return if "@argv" =~ /\b-l\b/; # no point w/o C++ in lei
+	my $cmd;
+	$cmd = eval "require $cls; ${cls}::cmd()" if $sock_type eq 'seq';
+	unless ($cmd) { # fall back to Perl + XS|SWIG
+		return if grep { $_ eq '-l' } @argv; # no point w/o C++ in lei
 		$cls = 'PublicInbox::XapHelper';
 		# ensure the child process has the same @INC we do:
 		$env = { PERL5LIB => join(':', @INC) };

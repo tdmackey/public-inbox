@@ -2,10 +2,11 @@
 # Copyright (C) all contributors <meta@public-inbox.org>
 # License: AGPL-3.0+ <https://www.gnu.org/licenses/agpl-3.0.txt>
 use v5.12;
-use Socket qw(AF_UNIX SOCK_SEQPACKET pack_sockaddr_un MSG_EOR);
+use Socket qw(pack_sockaddr_un);
 use PublicInbox::Syscall ();
+use PublicInbox::IPCSocket qw(lei_client_socket lei_sock_path);
 my $narg = 5;
-my $sock;
+my ($sock, $sock_type);
 my $recv_cmd = PublicInbox::Syscall->can('recv_cmd4') // do {
 	# configure Inline::C + Spawn before loading PublicInbox::IPC
 	my $inline_dir = $ENV{PERL_INLINE_DIRECTORY} //= (
@@ -78,14 +79,14 @@ unless (-d $runtime_dir) {
 	require File::Path;
 	File::Path::make_path($runtime_dir, { mode => 0700 });
 }
-my $path = "$runtime_dir/$narg.seq.sock";
+($sock, $sock_type) = lei_client_socket();
+my $path = lei_sock_path($runtime_dir, $narg, $sock_type);
 my $addr = pack_sockaddr_un($path);
-socket($sock, AF_UNIX, SOCK_SEQPACKET, 0) or die "socket: $!";
 unless (connect($sock, $addr)) { # start the daemon if not started
 	local $ENV{PERL5LIB} = join(':', @INC);
 	open(my $daemon, '-|', $^X, $^W ? ('-w') : (),
 		qw[-MPublicInbox::LEI -e PublicInbox::LEI::lazy_start(@ARGV)],
-		$path, $! + 0, $narg) or die "popen: $!";
+		$path, $! + 0, $narg, $sock_type) or die "popen: $!";
 	while (<$daemon>) { warn $_ } # EOF when STDERR is redirected
 	close($daemon) or warn <<"";
 lei-daemon could not start, exited with \$?=$?
@@ -101,14 +102,14 @@ my $buf = join("\0", scalar(@ARGV), @ARGV);
 while (my ($k, $v) = each %ENV) { $buf .= "\0$k=$v" }
 $buf .= "\0\0";
 require PublicInbox::IPC; # FIXME: slow loading
-PublicInbox::IPC::sendcmd_eor($sock, \@io, $buf) // die "sendmsg: $!";
-$SIG{TSTP} = sub { PublicInbox::IPC::send_eor($sock, 'STOP'); kill 'STOP', $$ };
-$SIG{CONT} = sub { PublicInbox::IPC::send_eor($sock, 'CONT') };
+PublicInbox::IPC::sendcmd($sock, \@io, $buf) // die "sendmsg: $!";
+$SIG{TSTP} = sub { PublicInbox::IPC::send_pkt($sock, 'STOP'); kill 'STOP', $$ };
+$SIG{CONT} = sub { PublicInbox::IPC::send_pkt($sock, 'CONT') };
 
 my $x_it_code = 0;
 while (1) {
 	@io = ();
-	@io = PublicInbox::IPC::recvcmd_eor($sock, $buf);
+	@io = PublicInbox::IPC::recvcmd($sock, $buf);
 	die "recvmsg: $!" if scalar(@io) == 1 && !defined($io[0]);
 	last if $buf eq '';
 	if ($buf =~ /\Aexec (.+)\z/) {
@@ -116,7 +117,8 @@ while (1) {
 	} elsif ($buf eq '-WINCH') {
 		kill($buf, @parent); # for MUA
 	} elsif ($buf eq 'umask') {
-		send($sock, 'u'.pack('V', umask), MSG_EOR) or die "send: $!"
+		PublicInbox::IPC::send_pkt($sock, 'u'.pack('V', umask)) //
+			die "send: $!"
 	} elsif ($buf =~ /\Ax_it ([0-9]+)\z/) {
 		$x_it_code ||= $1 + 0;
 		last;
